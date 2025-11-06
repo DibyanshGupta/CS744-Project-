@@ -1,6 +1,10 @@
-// server.cpp
-// Build: g++ server.cpp -o server -std=c++17 -O2 -pthread -lpqxx -lpq
-// Requires: httplib.h (cpp-httplib) in same folder and libpqxx installed.
+// ===========================
+// server.cpp — HTTP-based Key-Value Store (String-only version)
+// ===========================
+
+// Build command:
+// g++ server.cpp -o server -std=c++17 -O2 -pthread -lpqxx -lpq
+// Requires: httplib.h and libpqxx (PostgreSQL C++ library)
 
 #include <iostream>
 #include <string>
@@ -10,68 +14,89 @@
 #include <optional>
 #include <chrono>
 #include <atomic>
+#include <sstream>
 
 #include <pqxx/pqxx>
-#include <httplib.h>
+#include "httplib.h"
 
-using namespace httplib;
+using namespace httplib;  // So we can use Server, Request, Response directly
 
-// ---------- Thread-safe LRU cache ----------
-template<typename K, typename V>
+// ==========================================================
+// ---------- Thread-safe LRU (Least Recently Used) Cache ----------
+// ==========================================================
+// Fixed version: key = std::string, value = std::string (no templates)
+
 class LRUCache {
 public:
-    explicit LRUCache(size_t capacity): capacity_(capacity) {}
+    // 'explicit' prevents accidental implicit conversions like LRUCache c = 10;
+    explicit LRUCache(size_t capacity) : cap(capacity) {}
 
-    std::optional<V> get(const K& key) {
-        std::lock_guard<std::mutex> lg(mu_);
-        auto it = map_.find(key);
-        if (it == map_.end()) return std::nullopt;
-        list_.splice(list_.begin(), list_, it->second.second);
+    // Get value by key if present in cache
+    std::optional<std::string> get(const std::string &key) {
+        std::lock_guard<std::mutex> lg(mut);
+        auto it = mpp.find(key);
+        if (it == mpp.end()) return std::nullopt;
+
+        // Move this key to the front (most recently used)
+        lst.splice(lst.begin(), lst, it->second.second);
         return it->second.first;
     }
 
-    void put(const K& key, const V& value) {
-        std::lock_guard<std::mutex> lg(mu_);
-        auto it = map_.find(key);
-        if (it != map_.end()) {
+    // Insert or update a key-value pair
+    void put(const std::string &key, const std::string &value) {
+        std::lock_guard<std::mutex> lg(mut);
+        auto it = mpp.find(key);
+
+        if (it != mpp.end()) {
+            // Key already exists → update and move to front
             it->second.first = value;
-            list_.splice(list_.begin(), list_, it->second.second);
+            lst.splice(lst.begin(), lst, it->second.second);
             return;
         }
-        if (map_.size() >= capacity_) {
-            auto lru = list_.back();
-            map_.erase(lru);
-            list_.pop_back();
+
+        // Evict least recently used key if cache full
+        if (mpp.size() >= cap) {
+            auto lru = lst.back();
+            mpp.erase(lru);
+            lst.pop_back();
         }
-        list_.push_front(key);
-        map_[key] = {value, list_.begin()};
+
+        // Insert new key at front
+        lst.push_front(key);
+        mpp[key] = {value, lst.begin()};
     }
 
-    void erase(const K& key) {
-        std::lock_guard<std::mutex> lg(mu_);
-        auto it = map_.find(key);
-        if (it == map_.end()) return;
-        list_.erase(it->second.second);
-        map_.erase(it);
+    // Remove a key from cache
+    void erase(const std::string &key) {
+        std::lock_guard<std::mutex> lg(mut);
+        auto it = mpp.find(key);
+        if (it == mpp.end()) return;
+        lst.erase(it->second.second);
+        mpp.erase(it);
     }
 
+    // Return current cache size
     size_t size() const {
-        std::lock_guard<std::mutex> lg(mu_);
-        return map_.size();
+        std::lock_guard<std::mutex> lg(mut);
+        return mpp.size();
     }
 
 private:
-    size_t capacity_;
-    std::list<K> list_;
-    std::unordered_map<K, std::pair<V, typename std::list<K>::iterator>> map_;
-    mutable std::mutex mu_;
+    size_t cap;  // Maximum cache size
+    std::list<std::string> lst;  // Stores keys (front = most recent)
+    std::unordered_map<std::string, std::pair<std::string, std::list<std::string>::iterator>> mpp;
+    mutable std::mutex mut;  // Thread safety
 };
 
-// ---------- DB wrapper (libpqxx) ----------
+// ==========================================================
+// ---------- Database Layer (using libpqxx) ----------
+// ==========================================================
+
 class KVDB {
 public:
     explicit KVDB(const std::string &connstr): connstr_(connstr) {}
 
+    // Insert or update
     bool put(const std::string &key, const std::string &value) {
         try {
             pqxx::connection C(connstr_);
@@ -79,7 +104,8 @@ public:
             txn.exec_params(
                 "INSERT INTO kv_store (key, value) VALUES ($1, $2) "
                 "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-                key, value);
+                key, value
+            );
             txn.commit();
             return true;
         } catch (const std::exception &e) {
@@ -88,6 +114,7 @@ public:
         }
     }
 
+    // Retrieve
     std::optional<std::string> get(const std::string &key) {
         try {
             pqxx::connection C(connstr_);
@@ -101,6 +128,7 @@ public:
         }
     }
 
+    // Delete
     bool del(const std::string &key) {
         try {
             pqxx::connection C(connstr_);
@@ -118,99 +146,115 @@ private:
     std::string connstr_;
 };
 
-// ---------- Simple server with metrics ----------
+// ==========================================================
+// ---------- Global Performance Metrics ----------
+// ==========================================================
+
 std::atomic<uint64_t> total_requests{0}, total_success{0}, cache_hits{0}, cache_misses{0};
 
-int main(int argc, char** argv) {
-    // config via env or defaults
-    const char* db_url_env = getenv("DB_CONN");
-    std::string db_conn = db_url_env ? db_url_env : "host=localhost user=postgres password=postgres dbname=kvdb";
-    const char* port_env = getenv("PORT");
-    int port = port_env ? atoi(port_env) : 8080;
-    const char* cache_env = getenv("CACHE_CAPACITY");
-    size_t cache_capacity = cache_env ? (size_t)std::stoul(cache_env) : 10000;
+// ==========================================================
+// ---------- Main: Start HTTP Server ----------
+// ==========================================================
 
-    std::cout << "DB_CONN=\"" << db_conn << "\" port=" << port << " cache_capacity=" << cache_capacity << "\n";
+int main(int argc, char** argv) {
+    // Read environment variables or use defaults
+    const char* db_env = getenv("DB_CONN");
+    std::string db_conn = db_env ? db_env : "host=postgres user=postgres password=postgres dbname=kvdb";
+    const char* p_env = getenv("PORT");
+    int port = p_env ? atoi(p_env) : 8080;
+    const char* c_env = getenv("CACHE_CAPACITY");
+    size_t cache_capacity = c_env ? std::stoul(c_env) : 500;
+
+    std::cout << "Starting KV server on port " << port << "\n";
+    std::cout << "DB_CONN=" << db_conn << " CACHE_CAPACITY=" << cache_capacity << "\n";
 
     KVDB db(db_conn);
-    LRUCache<std::string, std::string> cache(cache_capacity);
+    LRUCache cache(cache_capacity);
 
     Server svr;
-    svr.set_read_timeout(5,0);
-    svr.set_write_timeout(5,0);
+    svr.set_read_timeout(5, 0);
+    svr.set_write_timeout(5, 0);
 
-    // PUT /kv?key=KEY  (body = value)
-    svr.Put("/kv", [&](const Request& req, Response& res){
+    // ==========================================================
+    // PUT /kv?key=KEY
+    // ==========================================================
+    svr.Put("/kv", [&](const Request& req, Response& res) {
         total_requests++;
         auto key = req.get_param_value("key");
         if (key.empty()) { res.status = 400; res.set_content("missing key", "text/plain"); return; }
+
         std::string value = req.body;
-        bool ok = db.put(key, value);    // synchronous write for simplicity
+        bool ok = db.put(key, value);
         if (ok) {
             cache.put(key, value);
             total_success++;
-            res.status = 200;
-            res.set_content("ok", "text/plain");
+            res.status = 200; res.set_content("ok", "text/plain");
         } else {
-            res.status = 500;
-            res.set_content("db error", "text/plain");
+            res.status = 500; res.set_content("db error", "text/plain");
         }
     });
 
+    // ==========================================================
     // GET /kv?key=KEY
-    svr.Get("/kv", [&](const Request& req, Response& res){
+    // ==========================================================
+    svr.Get("/kv", [&](const Request& req, Response& res) {
         total_requests++;
         auto key = req.get_param_value("key");
         if (key.empty()) { res.status = 400; res.set_content("missing key", "text/plain"); return; }
 
-        // check cache
         auto v = cache.get(key);
         if (v.has_value()) {
             cache_hits++;
             total_success++;
-            res.status = 200;
-            res.set_content(v.value(), "text/plain");
+            res.status = 200; res.set_content(v.value(), "text/plain");
             return;
         }
 
         cache_misses++;
         auto val = db.get(key);
         if (!val.has_value()) {
-            res.status = 404;
-            res.set_content("not found", "text/plain");
+            res.status = 404; res.set_content("not found", "text/plain");
             return;
         }
         cache.put(key, val.value());
         total_success++;
-        res.status = 200;
-        res.set_content(val.value(), "text/plain");
+        res.status = 200; res.set_content(val.value(), "text/plain");
     });
 
+    // ==========================================================
     // DELETE /kv?key=KEY
-    svr.Delete("/kv", [&](const Request& req, Response& res){
+    // ==========================================================
+    svr.Delete("/kv", [&](const Request& req, Response& res) {
         total_requests++;
         auto key = req.get_param_value("key");
         if (key.empty()) { res.status = 400; res.set_content("missing key", "text/plain"); return; }
+
         bool ok = db.del(key);
         cache.erase(key);
-        if (ok) { total_success++; res.status = 200; res.set_content("deleted", "text/plain"); }
-        else { res.status = 500; res.set_content("error", "text/plain"); }
+        if (ok) {
+            total_success++;
+            res.status = 200; res.set_content("deleted", "text/plain");
+        } else {
+            res.status = 500; res.set_content("error", "text/plain");
+        }
     });
 
-    // metrics: simple JSON
-    svr.Get("/metrics", [&](const Request&, Response& res){
-        std::ostringstream o;
-        o << "{\n";
-        o << "\"total_requests\": " << total_requests.load() << ",\n";
-        o << "\"total_success\": " << total_success.load() << ",\n";
-        o << "\"cache_hits\": " << cache_hits.load() << ",\n";
-        o << "\"cache_misses\": " << cache_misses.load() << ",\n";
-        o << "\"cache_size\": " << cache.size() << "\n";
-        o << "}\n";
-        res.set_content(o.str(), "application/json");
+    // ==========================================================
+    // GET /metrics
+    // ==========================================================
+    svr.Get("/metrics", [&](const Request&, Response& res) {
+        std::ostringstream ss;
+        ss << "{\n";
+        ss << "\"total_requests\": " << total_requests.load() << ",\n";
+        ss << "\"total_success\": " << total_success.load() << ",\n";
+        ss << "\"cache_hits\": " << cache_hits.load() << ",\n";
+        ss << "\"cache_misses\": " << cache_misses.load() << ",\n";
+        ss << "\"cache_size\": " << cache.size() << "\n";
+        ss << "}\n";
+        res.set_content(ss.str(), "application/json");
     });
 
-    std::cout << "Starting server on 0.0.0.0:" << port << "\n";
+    // Start the server
     svr.listen("0.0.0.0", port);
     return 0;
 }
