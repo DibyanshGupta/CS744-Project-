@@ -55,9 +55,9 @@ A[Client] --> B[HTTP API Server]
 
 B --> C{Request Type}
 
-C -- PUT /kv--> D[Cache upsert & DB put]
+C -- PUT /kv--> D[Cache Update & DB insert]
 
-C -- GET /kv--> E[Cache get -> if miss DB get -> cache put]
+C -- GET /kv--> E[If Cache hit->Cache get -> Response=value <br> else Cache miss DB get -> cache update -> Response=value]
 
 C -- DELETE /kv--> F[DB delete -> Cache erase]
 
