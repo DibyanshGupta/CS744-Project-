@@ -1,53 +1,38 @@
-// ===========================
-// server.cpp — HTTP-based Key-Value Store (String-only version)
-// ===========================
-
-// Build command:
-// g++ server.cpp -o server -std=c++17 -O2 -pthread -lpqxx -lpq
-// Requires: httplib.h and libpqxx (PostgreSQL C++ library)
-
 #include <iostream>
 #include <string>
 #include <unordered_map>
 #include <list>
 #include <mutex>
-#include <optional>
 #include <chrono>
 #include <atomic>
 #include <sstream>
-
 #include <pqxx/pqxx>
 #include "httplib.h"
 
-using namespace httplib;  // So we can use Server, Request, Response directly
+using namespace std; // So we can use Server, Request, Response directly
 
-// ==========================================================
-// ---------- Thread-safe LRU (Least Recently Used) Cache ----------
-// ==========================================================
-// Fixed version: key = std::string, value = std::string (no templates)
-
-class LRUCache {
+// LRUCache Implementation
+class Cache
+{
 public:
-    // 'explicit' prevents accidental implicit conversions like LRUCache c = 10;
-    explicit LRUCache(size_t capacity) : cap(capacity) {}
+    Cache(int capacity) : cap(capacity) {}
 
     // Get value by key if present in cache
-    std::optional<std::string> get(const std::string &key) {
-        std::lock_guard<std::mutex> lg(mut);
+    bool get(string &key, string &out){
+        lock_guard<mutex> lg(mut);
         auto it = mpp.find(key);
-        if (it == mpp.end()) return std::nullopt;
-
-        // Move this key to the front (most recently used)
+        if (it == mpp.end())
+            return false;
         lst.splice(lst.begin(), lst, it->second.second);
-        return it->second.first;
+        out = it->second.first;
+        return true;
     }
 
-    // Insert or update a key-value pair
-    void put(const std::string &key, const std::string &value) {
-        std::lock_guard<std::mutex> lg(mut);
+    void put(string &key, string &value){
+        lock_guard<mutex> lg(mut);
         auto it = mpp.find(key);
 
-        if (it != mpp.end()) {
+        if (it != mpp.end()){
             // Key already exists → update and move to front
             it->second.first = value;
             lst.splice(lst.begin(), lst, it->second.second);
@@ -55,7 +40,7 @@ public:
         }
 
         // Evict least recently used key if cache full
-        if (mpp.size() >= cap) {
+        if (mpp.size() >= cap){
             auto lru = lst.back();
             mpp.erase(lru);
             lst.pop_back();
@@ -67,183 +52,191 @@ public:
     }
 
     // Remove a key from cache
-    void erase(const std::string &key) {
-        std::lock_guard<std::mutex> lg(mut);
+    void erase(string &key){
+        lock_guard<mutex> lg(mut);
         auto it = mpp.find(key);
-        if (it == mpp.end()) return;
+        if (it == mpp.end())
+            return;
         lst.erase(it->second.second);
         mpp.erase(it);
     }
 
     // Return current cache size
-    size_t size() const {
-        std::lock_guard<std::mutex> lg(mut);
+    int size(){
+        lock_guard<mutex> lg(mut);
         return mpp.size();
     }
 
 private:
-    size_t cap;  // Maximum cache size
-    std::list<std::string> lst;  // Stores keys (front = most recent)
-    std::unordered_map<std::string, std::pair<std::string, std::list<std::string>::iterator>> mpp;
-    mutable std::mutex mut;  // Thread safety
+    int cap;          // Maximum cache size
+    list<string> lst; // Stores keys (front = most recent)
+    unordered_map<string, pair<string, list<string>::iterator>> mpp;
+    mutex mut;
 };
 
-// ==========================================================
-// ---------- Database Layer (using libpqxx) ----------
-// ==========================================================
+// Database code
 
-class KVDB {
+class KVDB{
 public:
-    explicit KVDB(const std::string &connstr): connstr_(connstr) {}
+    KVDB(string &connstr) : connstr(connstr) {}
 
     // Insert or update
-    bool put(const std::string &key, const std::string &value) {
-        try {
-            pqxx::connection C(connstr_);
+    bool put(string &key, string &value){
+        try
+        {
+            pqxx::connection C(connstr);
             pqxx::work txn(C);
             txn.exec_params(
                 "INSERT INTO kv_store (key, value) VALUES ($1, $2) "
                 "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-                key, value
-            );
+                key, value);
             txn.commit();
             return true;
-        } catch (const std::exception &e) {
-            std::cerr << "DB put error: " << e.what() << "\n";
+        }
+        catch (exception &e)
+        {
+            cerr << "DB put error: " << e.what() << "\n";
             return false;
         }
     }
 
     // Retrieve
-    std::optional<std::string> get(const std::string &key) {
-        try {
-            pqxx::connection C(connstr_);
+    bool get(string &key, string &out){
+        try
+        {
+            pqxx::connection C(connstr);
             pqxx::work txn(C);
             pqxx::result r = txn.exec_params("SELECT value FROM kv_store WHERE key=$1", key);
-            if (r.empty()) return std::nullopt;
-            return r[0][0].as<std::string>();
-        } catch (const std::exception &e) {
-            std::cerr << "DB get error: " << e.what() << "\n";
-            return std::nullopt;
+            if (r.empty())
+                return false;
+            out = r[0][0].as<string>();
+            return true;
+        }
+        catch (exception &e)
+        {
+            cerr << "DB get error: " << e.what() << "\n";
+            return false;
         }
     }
 
     // Delete
-    bool del(const std::string &key) {
-        try {
-            pqxx::connection C(connstr_);
+    bool del(string &key){
+        try
+        {
+            pqxx::connection C(connstr);
             pqxx::work txn(C);
             txn.exec_params("DELETE FROM kv_store WHERE key=$1", key);
             txn.commit();
             return true;
-        } catch (const std::exception &e) {
-            std::cerr << "DB del error: " << e.what() << "\n";
+        }
+        catch (exception &e)
+        {
+            cerr << "DB del error: " << e.what() << "\n";
             return false;
         }
     }
 
 private:
-    std::string connstr_;
+    string connstr;
 };
 
-// ==========================================================
-// ---------- Global Performance Metrics ----------
-// ==========================================================
+// Performance Metrics
+atomic<uint64_t> total_requests{0}, total_success{0}, cache_hits{0}, cache_misses{0};
 
-std::atomic<uint64_t> total_requests{0}, total_success{0}, cache_hits{0}, cache_misses{0};
+// Main function
+int main(int argc, char **argv){
+    string dbConnection = "host=localhost user=postgres password=postgres dbname=kvdb";
+    int port = 8080;
+    int cacheCapacity = 2;
 
-// ==========================================================
-// ---------- Main: Start HTTP Server ----------
-// ==========================================================
+    cout << "Starting KV server on port " << port << "\n";
+    cout << "DB_CONN=" << dbConnection << " CACHE_CAPACITY=" << cacheCapacity << "\n";
 
-int main(int argc, char** argv) {
-    // Read environment variables or use defaults
-    const char* db_env = getenv("DB_CONN");
-    std::string db_conn = db_env ? db_env : "host=postgres user=postgres password=postgres dbname=kvdb";
-    const char* p_env = getenv("PORT");
-    int port = p_env ? atoi(p_env) : 8080;
-    const char* c_env = getenv("CACHE_CAPACITY");
-    size_t cache_capacity = c_env ? std::stoul(c_env) : 500;
+    KVDB db(dbConnection);
+    Cache cache(cacheCapacity);
 
-    std::cout << "Starting KV server on port " << port << "\n";
-    std::cout << "DB_CONN=" << db_conn << " CACHE_CAPACITY=" << cache_capacity << "\n";
-
-    KVDB db(db_conn);
-    LRUCache cache(cache_capacity);
-
-    Server svr;
+    httplib::Server svr;
     svr.set_read_timeout(5, 0);
     svr.set_write_timeout(5, 0);
 
-    // ==========================================================
-    // PUT /kv?key=KEY
-    // ==========================================================
-    svr.Put("/kv", [&](const Request& req, Response& res) {
+    // Insert or Update
+    svr.Put("/kv", [&](const httplib::Request &req, httplib::Response &res){
         total_requests++;
         auto key = req.get_param_value("key");
-        if (key.empty()) { res.status = 400; res.set_content("missing key", "text/plain"); return; }
+        if (key.empty()){ 
+            res.status = 400;
+            res.set_content("missing key", "text/plain"); 
+            return; 
+        }
 
-        std::string value = req.body;
+        string value = req.body;
         bool ok = db.put(key, value);
         if (ok) {
             cache.put(key, value);
             total_success++;
-            res.status = 200; res.set_content("ok", "text/plain");
-        } else {
-            res.status = 500; res.set_content("db error", "text/plain");
-        }
+            res.status = 200; res.set_content("Created/Updated\n", "text/plain");
+        } 
+        else {
+            res.status = 500; res.set_content("Database error", "text/plain");
+        } 
     });
 
-    // ==========================================================
-    // GET /kv?key=KEY
-    // ==========================================================
-    svr.Get("/kv", [&](const Request& req, Response& res) {
+    // Retrieve
+    svr.Get("/kv", [&](const httplib::Request &req, httplib::Response &res){
         total_requests++;
         auto key = req.get_param_value("key");
-        if (key.empty()) { res.status = 400; res.set_content("missing key", "text/plain"); return; }
+        if (key.empty()){
+            res.status = 400;
+            res.set_content("missing key", "text/plain");
+            return;
+        }
 
-        auto v = cache.get(key);
-        if (v.has_value()) {
+        string val;
+        if (cache.get(key, val)){
             cache_hits++;
             total_success++;
-            res.status = 200; res.set_content(v.value(), "text/plain");
+            res.status = 200;
+            res.set_content(val, "text/plain");
             return;
         }
 
         cache_misses++;
-        auto val = db.get(key);
-        if (!val.has_value()) {
-            res.status = 404; res.set_content("not found", "text/plain");
+        if (db.get(key, val)){
+            cache.put(key, val);
+            total_success++;
+            res.status = 200;
+            res.set_content(val, "text/plain");
             return;
         }
-        cache.put(key, val.value());
-        total_success++;
-        res.status = 200; res.set_content(val.value(), "text/plain");
+
+        res.status = 404;
+        res.set_content("Key not present\n", "text/plain"); 
     });
 
-    // ==========================================================
-    // DELETE /kv?key=KEY
-    // ==========================================================
-    svr.Delete("/kv", [&](const Request& req, Response& res) {
+    // Delete
+    svr.Delete("/kv", [&](const httplib::Request &req, httplib::Response &res){
         total_requests++;
         auto key = req.get_param_value("key");
-        if (key.empty()) { res.status = 400; res.set_content("missing key", "text/plain"); return; }
+        if (key.empty()) { 
+            res.status = 400; 
+            res.set_content("Missing Key\n", "text/plain"); 
+            return; 
+        }
 
         bool ok = db.del(key);
         cache.erase(key);
-        if (ok) {
+        if(ok){
             total_success++;
-            res.status = 200; res.set_content("deleted", "text/plain");
-        } else {
-            res.status = 500; res.set_content("error", "text/plain");
-        }
+            res.status = 200; res.set_content("Deleted\n", "text/plain");
+        } 
+        else{
+            res.status = 500; res.set_content("Database error\n", "text/plain");
+        } 
     });
 
-    // ==========================================================
-    // GET /metrics
-    // ==========================================================
-    svr.Get("/metrics", [&](const Request&, Response& res) {
-        std::ostringstream ss;
+    // Get Metrics value
+    svr.Get("/metrics", [&](const httplib::Request &, httplib::Response &res){
+        ostringstream ss;
         ss << "{\n";
         ss << "\"total_requests\": " << total_requests.load() << ",\n";
         ss << "\"total_success\": " << total_success.load() << ",\n";
@@ -251,7 +244,7 @@ int main(int argc, char** argv) {
         ss << "\"cache_misses\": " << cache_misses.load() << ",\n";
         ss << "\"cache_size\": " << cache.size() << "\n";
         ss << "}\n";
-        res.set_content(ss.str(), "application/json");
+        res.set_content(ss.str(), "application/json"); 
     });
 
     // Start the server
