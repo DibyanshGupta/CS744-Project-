@@ -9,12 +9,16 @@
 #include <pqxx/pqxx>
 #include "httplib.h"
 
-using namespace std; // So we can use Server, Request, Response directly
+using namespace std; 
+
+// Variables for Performance Metrics
+atomic<uint64_t> total_requests{0}, total_success{0}, cache_hits{0}, cache_misses{0};
 
 // LRUCache Implementation
 class Cache
 {
 public:
+    // Constructor initialization
     Cache(int capacity) : cap(capacity) {}
 
     // Get value by key if present in cache
@@ -28,6 +32,7 @@ public:
         return true;
     }
 
+    // Insert of update key in cache
     void put(string &key, string &value){
         lock_guard<mutex> lg(mut);
         auto it = mpp.find(key);
@@ -75,9 +80,9 @@ private:
 };
 
 // Database code
-
 class KVDB{
 public:
+    // Constructor intialization
     KVDB(string &connstr) : connstr(connstr) {}
 
     // Insert or update
@@ -140,11 +145,10 @@ private:
     string connstr;
 };
 
-// Performance Metrics
-atomic<uint64_t> total_requests{0}, total_success{0}, cache_hits{0}, cache_misses{0};
 
 // Main function
 int main(int argc, char **argv){
+    // Configuration setup
     string dbConnection = "host=localhost user=postgres password=postgres dbname=kvdb";
     int port = 8080;
     int cacheCapacity = 2;
@@ -152,6 +156,7 @@ int main(int argc, char **argv){
     cout << "Starting KV server on port " << port << "\n";
     cout << "DB_CONN=" << dbConnection << " CACHE_CAPACITY=" << cacheCapacity << "\n";
 
+    // Connection establishment and initialization
     KVDB db(dbConnection);
     Cache cache(cacheCapacity);
 
@@ -159,7 +164,7 @@ int main(int argc, char **argv){
     svr.set_read_timeout(5, 0);
     svr.set_write_timeout(5, 0);
 
-    // Insert or Update
+    // Insert or Update a key-value pair
     svr.Put("/kv", [&](const httplib::Request &req, httplib::Response &res){
         total_requests++;
         auto key = req.get_param_value("key");
@@ -181,7 +186,7 @@ int main(int argc, char **argv){
         } 
     });
 
-    // Retrieve
+    // Retrieve the value for a key
     svr.Get("/kv", [&](const httplib::Request &req, httplib::Response &res){
         total_requests++;
         auto key = req.get_param_value("key");
