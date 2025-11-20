@@ -45,34 +45,27 @@ It is designed for low latency and high availability using an in-memory **LRU ca
 
 ---
 
-### 🧱 System Architecture (Hierarchical)
+## 🧱 System Architecture (Hierarchical)
 
 ```mermaid
-flowchart TB
-  A[Client / CLI / API Consumer] --> B[HTTP Server<br/>(cpp-httplib)]
 
-  subgraph API["API Layer"]
-    B --> C[Request Router & Validator]
-    C --> D[LRU Cache]
-    C --> E[PostgreSQL (libpqxx)]
-    C --> F[Metrics / Logger]
-  end
+graph TD
 
-  subgraph CACHE["Cache Layer"]
-    D1[In-process LRU Cache<br/>(unordered_map + list)]
-    D2[(Optional: Redis)]
-    D --> D1
-    D --> D2
-  end
+A[Client] --> B[HTTP API Server]
 
-  subgraph STORAGE["Storage Layer"]
-    E1[(PostgreSQL Database)]
-  end
+B --> C{Request Type}
 
-  subgraph INFRA["Monitoring & Infra"]
-    G[Prometheus / Grafana]
-    H[Log Aggregation (ELK / Loki)]
-  end
+C -- PUT /kv--> D[Cache Update & DB insert]
 
-  F --> G
-  F --> H
+C -- GET /kv--> E[If Cache hit->Cache get -> Response=value <br> else Cache miss DB get -> cache update -> Response=value]
+
+C -- DELETE /kv--> F[DB delete -> Cache erase]
+
+D --> G[DB Layer]
+
+E --> G
+
+F --> G
+
+G --> H[HTTP Response]
+```
