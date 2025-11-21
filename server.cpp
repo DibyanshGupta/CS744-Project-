@@ -151,7 +151,7 @@ int main(int argc, char **argv){
     // Configuration setup
     string dbConnection = "host=localhost user=postgres password=postgres dbname=kvdb";
     int port = 8080;
-    int cacheCapacity = 2;
+    int cacheCapacity = 100;
 
     cout << "Starting KV server on port " << port << "\n";
     cout << "DB_CONN=" << dbConnection << " CACHE_CAPACITY=" << cacheCapacity << "\n";
