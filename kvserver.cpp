@@ -12,15 +12,15 @@
 using namespace std;
 using json = nlohmann::json;
 
-// =============== LRU CACHE (string->string) ================
+// LRU Cache Implementation
 class LRUCache {
-    size_t capacity;
+    int capacity;
     list<pair<string, string>> kvcache;
     unordered_map<string, list<pair<string, string>>::iterator> kvmap;
     mutable mutex mtx;
 
 public:
-    LRUCache(size_t cap) { capacity = cap; }
+    LRUCache(int cap) { capacity = cap; }
 
     void put(const string& key, const string& value) {
         lock_guard<mutex> lock(mtx);
@@ -58,7 +58,7 @@ public:
     }
 };
 
-// =================== POSTGRES CONFIG ===================
+// Postgres Database setup
 static const char* DB_CONNINFO =
     "host=localhost port=5432 user=postgres password=postgres dbname=kvdb";
 
@@ -109,7 +109,7 @@ PGconn* get_connection() {
     return thread_conn;
 }
 
-// ==================== JSON helpers ======================
+// JSON setup
 static std::string to_string_json_value(const nlohmann::json &v) {
     if (v.is_string()) return v.get<std::string>();
     if (v.is_number_integer()) return std::to_string(v.get<long long>());
@@ -122,11 +122,11 @@ static std::string to_string_json_value(const nlohmann::json &v) {
     return v.dump();
 }
 
-// convert JSON value (number or string) to int64 safely; returns false on error
-bool json_to_int64(const nlohmann::json &v, int64_t &out) {
+// JSON to integer
+bool jstonToInt(const nlohmann::json &v, int &out) {
     try {
         if (v.is_number_integer()) {
-            out = v.get<int64_t>();
+            out = v.get<int>();
             return true;
         }
         if (v.is_string()) {
@@ -135,31 +135,31 @@ bool json_to_int64(const nlohmann::json &v, int64_t &out) {
             size_t pos = 0;
             long long val = std::stoll(s, &pos);
             if (pos != s.size()) return false;
-            out = (int64_t)val;
+            out = (int)val;
             return true;
         }
         if (v.is_number_float()) {
-            out = static_cast<int64_t>(v.get<double>());
+            out = static_cast<int>(v.get<double>());
             return true;
         }
     } catch (...) { }
     return false;
 }
 
-// convert route path (string) to int64
-bool str_to_int64(const std::string &s, int64_t &out) {
+// convert route path from string to integer
+bool strToInt(const std::string &s, int &out) {
     try {
         if (s.empty()) return false;
         size_t pos = 0;
         long long val = std::stoll(s, &pos);
         if (pos != s.size()) return false;
-        out = (int64_t)val;
+        out = (int)val;
         return true;
     } catch (...) { return false; }
 }
 
-// ==================== DB OPERATIONS (integer key) ======================
-bool db_create_or_update(int64_t key, const std::string& value) {
+// Database operations
+bool db_create(int key, const std::string& value) {
     PGconn* conn = get_connection();
     if (!conn) return false;
 
@@ -169,13 +169,12 @@ bool db_create_or_update(int64_t key, const std::string& value) {
     PGresult* res = PQexecParams(conn,
         "INSERT INTO kv_store(\"key\", value) VALUES ($1::bigint, $2) "
         "ON CONFLICT (\"key\") DO UPDATE SET value = EXCLUDED.value",
-        2,            // number of params
-        NULL,         // param types
+        2,            
+        NULL,         
         paramValues,
-        NULL,         // param lengths
-        NULL,         // param formats
-        0);           // result format (text)
-
+        NULL,         
+        NULL,         
+        0);           
     if (!res) {
         cerr << "[DB] null result: " << PQerrorMessage(conn) << "\n";
         return false;
@@ -186,7 +185,7 @@ bool db_create_or_update(int64_t key, const std::string& value) {
     return ok;
 }
 
-bool db_read(int64_t key, std::string& value) {
+bool db_read(int key, std::string& value) {
     PGconn* conn = get_connection();
     if (!conn) return false;
 
@@ -213,7 +212,7 @@ bool db_read(int64_t key, std::string& value) {
     return true;
 }
 
-bool db_delete(int64_t key) {
+bool db_delete(int key) {
     PGconn* conn = get_connection();
     if (!conn) return false;
 
@@ -234,7 +233,8 @@ bool db_delete(int64_t key) {
     return ok;
 }
 
-// ================= SERVER ======================
+// main code
+
 LRUCache cache(100);
 
 int main(int argc, char* argv[]) {
@@ -264,13 +264,13 @@ int main(int argc, char* argv[]) {
             return crow::response(400, "Missing key or value");
         }
 
-        int64_t key_num;
-        if (!json_to_int64(j["key"], key_num)) {
+        int key_num;
+        if (!jstonToInt(j["key"], key_num)) {
             return crow::response(400, "Invalid key (expected integer)");
         }
 
         std::string value = to_string_json_value(j["value"]);
-        bool done = db_create_or_update(key_num, value);
+        bool done = db_create(key_num, value);
         if (done) cache.put(std::to_string(key_num), value);
         return crow::response(done ? 200 : 500, done ? "Created" : "DB Error");
     });
@@ -281,8 +281,8 @@ int main(int argc, char* argv[]) {
         bool hit = cache.get(key_path, value);
         if (hit) return crow::response(200, value);
 
-        int64_t key_num;
-        if (!str_to_int64(key_path, key_num)) return crow::response(400, "Invalid key");
+        int key_num;
+        if (!strToInt(key_path, key_num)) return crow::response(400, "Invalid key");
 
         if (db_read(key_num, value)) {
             cache.put(key_path, value);
@@ -293,16 +293,16 @@ int main(int argc, char* argv[]) {
 
     CROW_ROUTE(app, "/delete/<string>").methods("DELETE"_method)
     ([](const std::string &key_path){
-        int64_t key_num;
-        if (!str_to_int64(key_path, key_num)) return crow::response(400, "Invalid key");
+        int key_num;
+        if (!strToInt(key_path, key_num)) return crow::response(400, "Invalid key");
 
         bool done = db_delete(key_num);
         if (done) cache.remove(key_path);
         return crow::response(done ? 200 : 500, done ? "Deleted" : "Not found");
     });
 
-    cout << "Server running on port 8080 using " << threads << " threads\n";
+    cout << "Server port no. =  8000 , using threads = " << threads << "\n";
     app.loglevel(crow::LogLevel::Error);
-    app.port(8080).concurrency(threads).run();
+    app.port(8000).concurrency(threads).run();
     return 0;
 }
